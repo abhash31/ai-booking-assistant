@@ -1,0 +1,27 @@
+[
+  {
+    "doctor_name": "Dr. Aisha Khan",
+    "expertise": "Cardiologist",
+    "timings": "9:00 AM - 12:00 PM"
+  },
+  {
+    "doctor_name": "Dr. Rohit Mehra",
+    "expertise": "Dermatologist",
+    "timings": "10:00 AM - 1:00 PM"
+  },
+  {
+    "doctor_name": "Dr. Fatima Siddiqui",
+    "expertise": "Pediatrician",
+    "timings": "11:00 AM - 2:00 PM"
+  },
+  {
+    "doctor_name": "Dr. Zain Ahmed",
+    "expertise": "Orthopedic Surgeon",
+    "timings": "2:00 PM - 5:00 PM"
+  },
+  {
+    "doctor_name": "Dr. Neha Varma",
+    "expertise": "ENT Specialist",
+    "timings": "3:00 PM - 6:00 PM"
+  }
+]
