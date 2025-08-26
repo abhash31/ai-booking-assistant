@@ -1,28 +1,3 @@
-# import json
-# import pyaudio
-# from vosk import Model, KaldiRecognizer
-#
-# class VoskSpeech:
-#     def __init__(self, path_to_model):
-#         model = Model(path_to_model)
-#
-#         self.recognizer = KaldiRecognizer(model, 16000)
-#
-#         self.mic = pyaudio.PyAudio()
-#
-#     def get_text_from_speech(self):
-#         stream = self.mic.open(rate=16000, channels=1, format=pyaudio.paInt16, input=True, frames_per_buffer=8192)
-#         stream.start_stream()
-#         data = stream.read(4096)
-#         if self.recognizer.AcceptWaveform(data):
-#             res = self.recognizer.Result()
-#             data = json.loads(res)
-#
-#             extracted = data["text"]
-#             print(extracted)
-#             stream.stop_stream()
-#             return extracted
-
 import json
 import time
 import pyaudio
@@ -74,5 +49,5 @@ class VoskSpeech:
         return full_text.strip()
 
 # Example usage:
-# recognizer = VoskSpeech("vosk-model-small-en-us-0.15")
-# print("Recognized:", recognizer.get_text_from_speech())
+recognizer = VoskSpeech("tts_stt/vosk_stt_model/vosk-model-small-en-in-0.4")
+print("Recognized:", recognizer.get_text_from_speech())

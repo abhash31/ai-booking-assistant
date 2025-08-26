@@ -29,6 +29,7 @@ Settings.embed_model = OllamaEmbedding(model_name='nomic-embed-text')
 
 Settings.llm = Ollama(
     model="gemma3:4b",
+    base_url="http://localhost:11434/",
     context_window=8192,
     temperature=0.0,
     request_timeout=30.0,
@@ -97,8 +98,6 @@ def chat_with_gemini():
             # aud = tts.listen_speech()
             # speech_txt = tts.speech_to_text(aud)
             # user_input = stt.get_text_from_speech()
-            # # print(user_input)
-            # prompt = SYSTEM_PROMPT
             user_input = input("input: ")
             # user_input = prompt + "\n" + user_input
             # print(f"input: {user_input}")
