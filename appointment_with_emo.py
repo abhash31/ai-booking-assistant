@@ -3,14 +3,16 @@ import random
 import pygame
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+from llama_index.core.base.llms.types import ChatMessage
 from llama_index.embeddings.ollama import OllamaEmbedding
 from booking_message import format_booking_message
-from database.doctor_database import DoctorDB
-from database.patient_database import BookingManager
+from credentials import BASE_URL
+# from database.doctor_database import DoctorDB
+# from database.patient_database import BookingManager
 from prompts import SYSTEM_PROMPT, chat_text_booking_prompt_str, chat_refine_booking_prompt_str
 from regex import get_booking_data
+from stt_for_rpi import SpeechRecognitionGoogle
 from tts_stt.ai_voice_call import Piper
-from vosk_test import VoskSpeech
 from llama_index.core import Settings, SimpleDirectoryReader, VectorStoreIndex
 from llama_index.core.chat_engine.types import ChatMode
 from llama_index.llms.ollama import Ollama
@@ -19,12 +21,12 @@ from llama_index.core.storage.chat_store import SimpleChatStore
 from llama_index.core.memory import ChatMemoryBuffer
 
 # ============ LLM CONFIG ============
-Settings.embed_model = OllamaEmbedding(model_name='nomic-embed-text')
+Settings.embed_model = OllamaEmbedding(model_name='nomic-embed-text', base_url=BASE_URL)
 
 Settings.llm = Ollama(
-    model="gemma3:4b",
-    base_url="http://localhost:11434/",
-    request_timeout=45.0,
+    model="gemma3:12b",
+    base_url= BASE_URL,
+    request_timeout=120.0,
     additional_kwargs={
         "num_ctx": 2048,
         "num_predict": 256,
@@ -39,8 +41,6 @@ index = VectorStoreIndex.from_documents(docs)
 chat_store = SimpleChatStore()
 chat_memory = ChatMemoryBuffer.from_defaults(token_limit=3000, chat_store=chat_store, chat_store_key="user1")
 
-
-
 # ============ Chat Engine Setup ============
 text_booking_template = RichPromptTemplate(chat_text_booking_prompt_str)
 refine_template = RichPromptTemplate(chat_refine_booking_prompt_str)
@@ -48,8 +48,8 @@ refine_template = RichPromptTemplate(chat_refine_booking_prompt_str)
 chat_engine = index.as_chat_engine(
     memory=chat_memory,
     system_prompt=SYSTEM_PROMPT,
-    similarity_top_k=4,
-    chat_mode=ChatMode.CONTEXT,
+    refine_template= chat_refine_booking_prompt_str,
+    chat_mode=ChatMode.BEST,
     streaming=True,
 )
 
@@ -59,20 +59,18 @@ chat_engine = index.as_chat_engine(
 
 # ============ Speech to Text and Text to Speech ============
 tts = Piper('tts_stt/piper_tts_model/en_US-lessac-medium.onnx')
-stt = VoskSpeech('tts_stt/vosk_stt_model/vosk-model-small-en-in-0.4')  # has start_listen/stop_listen
+# stt = VoskSpeech('tts_stt/vosk_stt_model/vosk-model-small-en-in-0.4')  # has start_listen/stop_listen
+stt = SpeechRecognitionGoogle()
 
 thinking_string = [
-"Got it — let me check.",
-"All right, let me see",
-"On it—give me a moment.",
-"Let me see what I can do.",
-"Reviewing your request…",
-"Working on this…",
-"Thanks—working on it now.",
+"Got it. Let me check.",
+"All right. Let me see",
+"On it. Give me a moment.",
+"Okay. Let me see what I can do.",
+"Alright. Reviewing your request…",
 "Noted. I’m on it.",
 "Just a moment while I check.",
-"Let me grab those details…",
-"Got it—working on this.",
+"Got it. Working on this.",
 ]
 
 # ================== UI  ==================
@@ -215,19 +213,28 @@ class App:
         # greeting (TTS blocks; keep mic muted)
         self.ui_set_emotion("idle")
         # stt.stop_listen()
+        greeting = "Hello! How can I help you?"
+        history = chat_store.get_messages("user1")
+        self.ui_set_text("Hello! How can I help you?")
         tts.get_and_speak("Hello! How can I help you?")   # Piper blocking speak method name may be .say or .speak
-        time.sleep(0.15)
-
+        history.append(ChatMessage(role='assistant', content=greeting))
+        chat_store.persist(persist_path="chat_store.json")
         while self.ui.running:
             # 1) LISTEN
-            self.ui_set_emotion("idle")
-            self.ui_set_text("")  # clear
+            self.ui_set_emotion("listening")
+            self.ui_clear()  # clear
             user_text = stt.get_text_from_speech()  # waits for speech + silence
+            history.append(ChatMessage(role='user', content=user_text))
+            chat_store.persist(persist_path="chat_store.json")
+            self.ui_set_text(f"{user_text}.\n")
             if not self.ui.running:
                 break
             if not user_text:
                 continue
-            if user_text.strip().lower() in ("exit", "quit", "bye", "thank you"):
+            if ("exit" in user_text.strip().lower()
+                or "quit" in user_text.strip().lower()
+                or "bye" in user_text.strip().lower()
+                or "thank you" in user_text.strip().lower()):
                 self.ui_set_emotion("speaking")
                 self.ui_set_text("Goodbye!")
                 tts.get_and_speak("You are welcome! Have a nice day.")
@@ -237,29 +244,30 @@ class App:
             # 2) THINK (LLM)
             self.ui_set_emotion("thinking")
             think = random.choice(thinking_string)
-            tts.get_and_speak_non_blocking(f"You Said: {user_text}. {think}")
-            self.ui_set_text(think)
-
+            tts.get_and_speak(think)
+            self.ui_append_text(f"\n{think}")
             # Stream tokens so the screen updates live
             try:
                 resp = chat_engine.stream_chat(user_text)  # returns StreamingAgentChatResponse
                 answer = []
-                self.ui_set_text("")
+                # self.ui_clear()
                 for token in resp.response_gen:  # iterate the generator, not resp
                     answer.append(token)
-                    self.ui_append_text(token)  # update your UI incrementally
+                    # self.ui_append_text(token)  # update your UI incrementally
                 res_text = "".join(answer).strip().replace("*", "")
             except Exception as e:
                 res_text = f"(error) {e}"
                 self.ui_set_emotion("speaking")
 
             # 3) BOOK if confirmation present (your guard/regex)
-            if "BOOKING_CONFIRMATION" in res_text:
+            if "BOOKING_CONFIRMATION" in res_text or "BOOKING CONFIRMATION" in res_text or "BOOKING" in res_text and "CONFIRMATION":
                 try:
+                    print(res_text)
                     data = get_booking_data(res_text)
                     booked = {
                         "patient": data["patient"],
                         "age": int(data["age"]),
+                        "service": data["service"],
                         "doctor": data["doctor"],
                         "date": data["date"],
                         "time": data["time"],
@@ -272,6 +280,8 @@ class App:
                     #     time=data["time"],
                     # )
                     res_text = format_booking_message(booked)
+                    history.pop()
+                    # chat_memory.put(ChatMessage(role="assistant", content=res_text))
                 except Exception as e:
                     res_text = f"Booking error: {e}"
                     self.ui_set_emotion("error")
@@ -279,11 +289,15 @@ class App:
             # 4) SPEAK (and then go back to listening)
             self.ui_set_emotion("speaking")
             # Replace screen text with the final message (keeps it short if LLM rambled)
+            self.ui_clear()
+            history.append(ChatMessage(role='assistant', content=res_text))
+            chat_store.set_messages("user1", history)
             self.ui_set_text(res_text)
             tts.get_and_speak(res_text)   # block; mic muted
             time.sleep(0.2)
             # stt.start_listen()
             self.ui_set_emotion("idle")
+            chat_store.persist(persist_path="chat_store.json")
             # leave the last message on screen until next input
 
     # ---- main loop on the MAIN thread (required by pygame) ----

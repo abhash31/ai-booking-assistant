@@ -1,0 +1,14 @@
+[
+  {
+    "service_name": "X-Ray",
+    "timings": "9:00 AM - 6:00 PM"
+  },
+  {
+    "service_name": "Blood Test",
+    "timings": "9:00 AM - 6:00 PM"
+  },
+  {
+    "service_name": "Delivery",
+    "timings": "given by gynecologist"
+  }
+]

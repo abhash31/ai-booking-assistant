@@ -48,6 +48,6 @@ class VoskSpeech:
 
         return full_text.strip()
 
-# Example usage:
-recognizer = VoskSpeech("tts_stt/vosk_stt_model/vosk-model-small-en-in-0.4")
-print("Recognized:", recognizer.get_text_from_speech())
+# # Example usage:
+# recognizer = VoskSpeech("tts_stt/vosk_stt_model/vosk-model-small-en-in-0.4")
+# print("Recognized:", recognizer.get_text_from_speech())
