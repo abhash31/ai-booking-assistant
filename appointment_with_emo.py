@@ -1,5 +1,7 @@
 import os, time, threading, queue
 import random
+import sys
+
 import pygame
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -7,6 +9,7 @@ from llama_index.core.base.llms.types import ChatMessage
 from llama_index.embeddings.ollama import OllamaEmbedding
 from booking_message import format_booking_message
 from credentials import BASE_URL
+from firebase_realtime_database import FirebaseListener
 # from database.doctor_database import DoctorDB
 # from database.patient_database import BookingManager
 from prompts import SYSTEM_PROMPT, chat_text_booking_prompt_str, chat_refine_booking_prompt_str
@@ -21,11 +24,13 @@ from llama_index.core.storage.chat_store import SimpleChatStore
 from llama_index.core.memory import ChatMemoryBuffer
 
 # ============ LLM CONFIG ============
-Settings.embed_model = OllamaEmbedding(model_name='nomic-embed-text', base_url=BASE_URL)
+Settings.embed_model = OllamaEmbedding(model_name='nomic-embed-text',
+                                       # base_url=BASE_URL
+                                       )
 
 Settings.llm = Ollama(
-    model="gemma3:12b",
-    base_url= BASE_URL,
+    model="gemma3:4b",
+    # base_url= BASE_URL,
     request_timeout=120.0,
     additional_kwargs={
         "num_ctx": 2048,
@@ -53,13 +58,17 @@ chat_engine = index.as_chat_engine(
     streaming=True,
 )
 
+cred_path = 'credentials/serviceCred.json'
+db_url = 'https://ai-booking-assistant-14491-default-rtdb.firebaseio.com'
+ref_path = 'CallState/state'
+fb_listener = FirebaseListener(cred_path, db_url, ref_path)
+
 # ============ Database Setup ============
 # db = DoctorDB(); db.load_from_json_file('data/doctors_list.json')
 # booking_manager = BookingManager()
 
 # ============ Speech to Text and Text to Speech ============
 tts = Piper('tts_stt/piper_tts_model/en_US-lessac-medium.onnx')
-# stt = VoskSpeech('tts_stt/vosk_stt_model/vosk-model-small-en-in-0.4')  # has start_listen/stop_listen
 stt = SpeechRecognitionGoogle()
 
 thinking_string = [
@@ -191,11 +200,23 @@ class App:
     def __init__(self):
         self.ui = UIState()
         self.display = EmotionDisplay(emotion_root="emotions", fps=60, font_size=40)
-
         self.cmd_q: "queue.Queue[UICommand]" = queue.Queue()
+        self.state_q: "queue.Queue[str]" = queue.Queue()
         self.worker = threading.Thread(target=self.conversation_loop, daemon=True)
+        self.in_call = False
 
-    # ---- helpers to talk to UI (thread-safe) ----
+        # start Firebase listening
+        fb_listener.start_listening(self.on_state_change)
+
+    def on_state_change(self, new_state: str):
+        """Runs on Firebase listener thread; keep it thread-safe and fast."""
+        if isinstance(new_state, dict):
+            # if you ever listen to a parent and get a dict, pick the leaf you care about
+            new_state = new_state.get("state")
+        if new_state is not None:
+            self.state_q.put(str(new_state))
+
+        # ---- helpers to talk to UI (thread-safe) ----
     def ui_set_emotion(self, name: str):
         self.cmd_q.put(UICommand(emotion=name))
 
@@ -208,118 +229,252 @@ class App:
     def ui_clear(self):
         self.cmd_q.put(UICommand(clear_text=True))
 
-    # ---- conversation orchestration in background ----
     def conversation_loop(self):
-        # greeting (TTS blocks; keep mic muted)
-        self.ui_set_emotion("idle")
-        # stt.stop_listen()
-        greeting = "Hello! How can I help you?"
+        # prime initial state
+        self.in_call = False
+        try:
+            initial_state = fb_listener.get_state()
+            if initial_state is not None:
+                self.state_q.put(str(initial_state))
+        except Exception:
+            pass
+
         history = chat_store.get_messages("user1")
-        self.ui_set_text("Hello! How can I help you?")
-        tts.get_and_speak("Hello! How can I help you?")   # Piper blocking speak method name may be .say or .speak
-        history.append(ChatMessage(role='assistant', content=greeting))
-        chat_store.persist(persist_path="chat_store.json")
+
         while self.ui.running:
-            # 1) LISTEN
-            self.ui_set_emotion("listening")
-            self.ui_clear()  # clear
-            user_text = stt.get_text_from_speech()  # waits for speech + silence
-            history.append(ChatMessage(role='user', content=user_text))
-            chat_store.persist(persist_path="chat_store.json")
-            self.ui_set_text(f"{user_text}.\n")
-            if not self.ui.running:
-                break
-            if not user_text:
-                continue
-            if ("exit" in user_text.strip().lower()
-                or "quit" in user_text.strip().lower()
-                or "bye" in user_text.strip().lower()
-                or "thank you" in user_text.strip().lower()):
-                self.ui_set_emotion("speaking")
-                self.ui_set_text("Goodbye!")
-                tts.get_and_speak("You are welcome! Have a nice day.")
-                self.ui.running = False
-                break
-
-            # 2) THINK (LLM)
-            self.ui_set_emotion("thinking")
-            think = random.choice(thinking_string)
-            tts.get_and_speak(think)
-            self.ui_append_text(f"\n{think}")
-            # Stream tokens so the screen updates live
+            # Wait for a state update (blocks until Firebase pushes something)
             try:
-                resp = chat_engine.stream_chat(user_text)  # returns StreamingAgentChatResponse
-                answer = []
-                # self.ui_clear()
-                for token in resp.response_gen:  # iterate the generator, not resp
-                    answer.append(token)
-                    # self.ui_append_text(token)  # update your UI incrementally
-                res_text = "".join(answer).strip().replace("*", "")
-            except Exception as e:
-                res_text = f"(error) {e}"
-                self.ui_set_emotion("speaking")
+                call_state = fb_listener.get_state()
+            except queue.Empty:
+                continue
 
-            # 3) BOOK if confirmation present (your guard/regex)
-            if "BOOKING_CONFIRMATION" in res_text or "BOOKING CONFIRMATION" in res_text or "BOOKING" in res_text and "CONFIRMATION":
+            call_state_norm = (call_state or "").strip().lower()
+
+            if call_state_norm == "idle":
+                self.in_call = False
+                self.ui_set_emotion("idle")
+                # Clear convo
                 try:
-                    print(res_text)
-                    data = get_booking_data(res_text)
-                    booked = {
-                        "patient": data["patient"],
-                        "age": int(data["age"]),
-                        "service": data["service"],
-                        "doctor": data["doctor"],
-                        "date": data["date"],
-                        "time": data["time"],
-                    }
-                    # booked = booking_manager.book_earliest(
-                    #     patient_name=data["patient"],
-                    #     patient_age=int(data["age"]),
-                    #     doctor_name=data["doctor"],
-                    #     date_str=data["date"],
-                    #     time=data["time"],
-                    # )
-                    res_text = format_booking_message(booked)
-                    history.pop()
-                    # chat_memory.put(ChatMessage(role="assistant", content=res_text))
-                except Exception as e:
-                    res_text = f"Booking error: {e}"
-                    self.ui_set_emotion("error")
+                    history.clear()
+                    chat_store.persist(persist_path="chat_store.json")
+                except Exception:
+                    pass
 
-            # 4) SPEAK (and then go back to listening)
-            self.ui_set_emotion("speaking")
-            # Replace screen text with the final message (keeps it short if LLM rambled)
-            self.ui_clear()
-            history.append(ChatMessage(role='assistant', content=res_text))
-            chat_store.set_messages("user1", history)
-            self.ui_set_text(res_text)
-            tts.get_and_speak(res_text)   # block; mic muted
-            time.sleep(0.2)
-            # stt.start_listen()
-            self.ui_set_emotion("idle")
-            chat_store.persist(persist_path="chat_store.json")
-            # leave the last message on screen until next input
+            elif call_state_norm == "call connected":
+                self.in_call = True
+                # Enter an "in-call" sub-loop that also watches for state changes
+                greeting = "Hello! How can I help you?"
+                self.ui_set_emotion("talking")
+                self.ui_set_text(greeting)
+                tts.get_and_speak(greeting)
+                history.append(ChatMessage(role='assistant', content=greeting))
+                chat_store.persist(persist_path="chat_store.json")
+
+
+                while self.ui.running and self.in_call:
+                    # 1) check if Firebase changed state while in-call (non-blocking)
+                    new_state = None
+                    try:
+                        new_state = fb_listener.get_state()
+                    except queue.Empty:
+                        pass
+                    if new_state:
+                        ns = (new_state or "").strip().lower()
+                        if ns != "call connected":
+                            # call ended or moved to another state
+                            self.in_call = False
+                            self.ui_set_emotion("idle")
+                            self.ui_clear()
+                            break
+
+                    print(new_state)
+
+                    # 2) normal call flow
+                    self.ui_set_emotion("listening")
+                    self.ui_clear()
+                    user_text = stt.get_text_from_speech()
+                    history.append(ChatMessage(role='user', content=user_text))
+                    chat_store.persist(persist_path="chat_store.json")
+                    self.ui_set_text(f"{user_text}.\n")
+
+                    if not self.ui.running:
+                        self.in_call = False
+                        break
+                    if not user_text:
+                        print("here")
+                        continue
+                    if any(k in user_text.strip().lower() for k in ("exit", "quit", "bye", "thank you")):
+                        self.ui_set_emotion("speaking")
+                        self.ui_set_text("Goodbye!")
+                        tts.get_and_speak("You are welcome! Have a nice day.")
+                        self.in_call = False
+                        break
+
+                    # THINK
+                    self.ui_set_emotion("thinking")
+                    think = random.choice(thinking_string)
+                    tts.get_and_speak(think)
+                    self.ui_append_text(f"\n{think}")
+                    try:
+                        resp = chat_engine.stream_chat(user_text)
+                        answer = []
+                        for token in resp.response_gen:
+                            answer.append(token)
+                        res_text = "".join(answer).strip().replace("*", "")
+                    except Exception as e:
+                        res_text = f"(error) {e}"
+                        self.ui_set_emotion("speaking")
+
+                    # BOOK (your existing logic)
+                    if ("BOOKING_CONFIRMATION" in res_text
+                            or "BOOKING CONFIRMATION" in res_text
+                            or ("BOOKING" in res_text and "CONFIRMATION" in res_text)):
+                        try:
+                            data = get_booking_data(res_text)
+                            booked = {
+                                "patient": data["patient"],
+                                "age": int(data["age"]),
+                                "service": data["service"],
+                                "doctor": data["doctor"],
+                                "date": data["date"],
+                                "time": data["time"],
+                            }
+                            res_text = format_booking_message(booked)
+                            history.pop()
+                        except Exception as e:
+                            res_text = f"Booking error: {e}"
+                            self.ui_set_emotion("error")
+
+                    # SPEAK
+                    self.ui_set_emotion("speaking")
+                    self.ui_clear()
+                    history.append(ChatMessage(role='assistant', content=res_text))
+                    chat_store.set_messages("user1", history)
+                    self.ui_set_text(res_text)
+                    tts.get_and_speak(res_text)
+                    time.sleep(0.2)
+                    self.ui_set_emotion("idle")
+                    chat_store.persist(persist_path="chat_store.json")
+
+                # end in-call loop; continue outer loop to react to next state
+
+    # ---- conversation orchestration in background ----
+    # def conversation_loop(self):
+    #     history = chat_store.get_messages("user1")
+    #     self.ui_set_emotion("idle")
+    #     history.clear()
+    #     chat_store.persist(persist_path="chat_store.json")
+    #     greeting = "Hello! How can I help you?"
+    #     self.ui_set_emotion("talking")
+    #
+    #     self.ui_set_text("Hello! How can I help you?")
+    #     tts.get_and_speak("Hello! How can I help you?")   # Piper blocking speak method name may be .say or .speak
+    #     history.append(ChatMessage(role='assistant', content=greeting))
+    #     chat_store.persist(persist_path="chat_store.json")
+    #     while self.ui.running:
+    #         # 1) LISTEN
+    #         self.ui_set_emotion("listening")
+    #         self.ui_clear()  # clear
+    #         user_text = stt.get_text_from_speech()  # waits for speech + silence
+    #         history.append(ChatMessage(role='user', content=user_text))
+    #         chat_store.persist(persist_path="chat_store.json")
+    #         self.ui_set_text(f"{user_text}.\n")
+    #         if not self.ui.running:
+    #             break
+    #         if not user_text:
+    #             continue
+    #         if ("exit" in user_text.strip().lower()
+    #             or "quit" in user_text.strip().lower()
+    #             or "bye" in user_text.strip().lower()
+    #             or "thank you" in user_text.strip().lower()):
+    #             self.ui_set_emotion("speaking")
+    #             self.ui_set_text("Goodbye!")
+    #             tts.get_and_speak("You are welcome! Have a nice day.")
+    #             self.ui.running = False
+    #             break
+    #
+    #         # 2) THINK (LLM)
+    #         self.ui_set_emotion("thinking")
+    #         think = random.choice(thinking_string)
+    #         tts.get_and_speak(think)
+    #         self.ui_append_text(f"\n{think}")
+    #         # Stream tokens so the screen updates live
+    #         try:
+    #             resp = chat_engine.stream_chat(user_text)  # returns StreamingAgentChatResponse
+    #             answer = []
+    #             # self.ui_clear()
+    #             for token in resp.response_gen:  # iterate the generator, not resp
+    #                 answer.append(token)
+    #                 # self.ui_append_text(token)  # update your UI incrementally
+    #             res_text = "".join(answer).strip().replace("*", "")
+    #         except Exception as e:
+    #             res_text = f"(error) {e}"
+    #             self.ui_set_emotion("speaking")
+    #
+    #         # 3) BOOK if confirmation present (your guard/regex)
+    #         if "BOOKING_CONFIRMATION" in res_text or "BOOKING CONFIRMATION" in res_text or "BOOKING" in res_text and "CONFIRMATION":
+    #             try:
+    #                 print(res_text)
+    #                 data = get_booking_data(res_text)
+    #                 booked = {
+    #                     "patient": data["patient"],
+    #                     "age": int(data["age"]),
+    #                     "service": data["service"],
+    #                     "doctor": data["doctor"],
+    #                     "date": data["date"],
+    #                     "time": data["time"],
+    #                 }
+    #                 # booked = booking_manager.book_earliest(
+    #                 #     patient_name=data["patient"],
+    #                 #     patient_age=int(data["age"]),
+    #                 #     doctor_name=data["doctor"],
+    #                 #     date_str=data["date"],
+    #                 #     time=data["time"],
+    #                 # )
+    #                 res_text = format_booking_message(booked)
+    #                 history.pop()
+    #                 # chat_memory.put(ChatMessage(role="assistant", content=res_text))
+    #             except Exception as e:
+    #                 res_text = f"Booking error: {e}"
+    #                 self.ui_set_emotion("error")
+    #
+    #         # 4) SPEAK (and then go back to listening)
+    #         self.ui_set_emotion("speaking")
+    #         # Replace screen text with the final message (keeps it short if LLM rambled)
+    #         self.ui_clear()
+    #         history.append(ChatMessage(role='assistant', content=res_text))
+    #         chat_store.set_messages("user1", history)
+    #         self.ui_set_text(res_text)
+    #         tts.get_and_speak(res_text)   # block; mic muted
+    #         time.sleep(0.2)
+    #         # stt.start_listen()
+    #         self.ui_set_emotion("idle")
+    #         chat_store.persist(persist_path="chat_store.json")
+    #         # leave the last message on screen until next input
 
     # ---- main loop on the MAIN thread (required by pygame) ----
     def run(self):
         self.worker.start()
         last_text = ""
-        while self.ui.running:
-            # drain command queue → update UIState
-            try:
-                while True:
-                    cmd: UICommand = self.cmd_q.get_nowait()
-                    if cmd.clear_text: self.ui.text = ""
-                    if cmd.set_text is not None: self.ui.text = cmd.set_text
-                    if cmd.append_text is not None:
-                        self.ui.text += cmd.append_text
-                    if cmd.emotion is not None: self.ui.emotion = cmd.emotion
-            except queue.Empty:
-                pass
+        try:
+            while self.ui.running:
+                # drain command queue → update UIState
+                try:
+                    while True:
+                        cmd: UICommand = self.cmd_q.get_nowait()
+                        if cmd.clear_text: self.ui.text = ""
+                        if cmd.set_text is not None: self.ui.text = cmd.set_text
+                        if cmd.append_text is not None:
+                            self.ui.text += cmd.append_text
+                        if cmd.emotion is not None: self.ui.emotion = cmd.emotion
+                except queue.Empty:
+                    pass
 
-            self.display.pump(self.ui)
+                self.display.pump(self.ui)
 
-        pygame.quit()
+        finally:
+            fb_listener.stop()
+            pygame.quit()
 
 if __name__ == "__main__":
     App().run()
